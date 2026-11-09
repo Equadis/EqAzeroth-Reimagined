@@ -69,10 +69,15 @@ class Compiler:
 def analyse(asm):
     slots = re.search(r"approximately (\d+) instruction slots? used", asm)
     body = [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith("//")]
-    temps = {int(x) for x in re.findall(r"\br(\d+)\b", " ".join(body))}
-    consts = {int(x) for x in re.findall(r"\bc(\d+)\b", " ".join(body))}
+    code = [l for l in body if not l.startswith(("def ", "defi ", "defb ", "dcl", "vs_"))]
+    # `def cN, ...` places a literal in a constant register the program did not declare: it counts towards the register
+    # limit but is not a read of the grass constants, so it is kept out of the "which constants are read" sets.
+    temps = {int(x) for x in re.findall(r"\br(\d+)\b", " ".join(code))}
+    read = {int(x) for x in re.findall(r"\bc(\d+)\b", " ".join(code))}
+    defined = {int(x) for x in re.findall(r"\bc(\d+)\b", " ".join(l.split(",")[0] for l in body if l.startswith("def ")))}
+    every = read | defined
     return dict(slots=int(slots.group(1)) if slots else -1, temps=(max(temps) + 1) if temps else 0,
-                const_max=max(consts) if consts else -1, consts=sorted(consts), instructions=len(body) - 1)
+                const_max=max(every) if every else -1, consts=sorted(read - defined), literal_consts=sorted(defined), instructions=len(code))
 
 
 def main():
