@@ -1,3 +1,6 @@
 addons/bin/
 *.addon32
 *.dll
+__pycache__/
+*.pyc
+grass_out/

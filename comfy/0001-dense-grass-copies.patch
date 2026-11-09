@@ -1,0 +1,455 @@
+diff --git a/comfyatmos.ini b/comfyatmos.ini
+index ebf16a9..5c77fa1 100644
+--- a/comfyatmos.ini
++++ b/comfyatmos.ini
+@@ -429,6 +429,24 @@ maxVerts        = 0       ; 0 = no limit
+ primType        = 4       ; D3DPT_TRIANGLELIST
+ debug           = 0       ; 1 = the bend as a colour (Debug View 30)
+ 
++; Dense grass (EqAzeroth): each of the client's grass batches is drawn again, a copy at a time, by the GPU with the copy
++; shader (grass.cpp). The copies move the batch by a smooth offset, thin themselves out in patches, change colour and tip
++; height a little, and sink into the ground with distance. The client's own grass is always drawn first and untouched.
++; density 1 = off and nothing extra is drawn. Cost: one more draw per copy per batch within densityDist, on the one CPU
++; thread: read "the grass's CPU a frame" in /atmos framelog before and after. F11 reloads.
++density       = 1.0     ; 1..8: draws of each batch in all, a smooth number (2.5 = the original, one copy and half a copy)
++densityDist  = 45      ; yards: where the first copy has faded out; the next copies end sooner (35 % less each step)
++densityFade  = 0.35    ; 0.05..1: the share of that distance over which a copy fades out
++spread       = 1.2     ; yards: how far a copy lies from the original blades
++wobble       = 0.45    ; yards: smooth change of that offset over the ground, so the copies do not repeat
++patch        = 1.5     ; yards: the size of the patches in which a partial copy (the .5 of 2.5) grows
++heightVar    = 0.25    ; yards: a copy's tip is higher or lower by up to this
++tintVar      = 0.12    ; 0..0.5: a copy's colour is warmer or greener by up to this
++alphaRef     = -1      ; -1: the client's alpha test. 0..255: alpha test (>=) for the copies only, so that the see-through
++                       ; parts of a card do not hide the copies behind it (try 96 if copies show square holes)
++chunkSign    = -1      ; which way a chunk lies from its corner, for the slope under a copy: -1 = to lower x and y
++copyDebug    = 0       ; 1 = copies in flat red to yellow by number: shows what is drawn
++
+ ; The time of day, on your screen only (comfytime until 2026-10-07). Ctrl+PageUp / Ctrl+PageDown move the time
+ ; by step hours, later / earlier; hold to keep moving. Ctrl+End switches between dayHour and nightHour. The Time
+ ; section of /atmos options sets enabled and localTime: Server time, Computer time or Fixed hour. With a fixed hour,
+diff --git a/src/comfyatmos.cpp b/src/comfyatmos.cpp
+index f953543..35b70e4 100644
+--- a/src/comfyatmos.cpp
++++ b/src/comfyatmos.cpp
+@@ -3246,7 +3246,7 @@ namespace
+         Log("device %s (vtable %p, SetRenderState orig=%p)", ok ? "hooked" : "HOOK FAILED", v, g_oSetRS);
+         if (ok)
+         {
+-            GrassAttach({ g_oDrawPrim, g_oDrawIdxPrim, g_oSetVS, g_oSetVSConstF });
++            GrassAttach({ g_oDrawPrim, g_oDrawIdxPrim, g_oSetVS, g_oSetVSConstF, g_oSetRS });
+             TimeAttach();
+         }
+     }
+diff --git a/src/config.cpp b/src/config.cpp
+index 72f2719..748cc90 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -553,6 +553,17 @@ void LoadSettings(const wchar_t* ini)
+     g.maxVerts        = static_cast<UINT>(GetI(kGrass, L"maxVerts", static_cast<int>(g.maxVerts), ini));
+     g.primType        = GetI(kGrass, L"primType", g.primType, ini);
+     g.debug           = GetI(kGrass, L"debug", g.debug, ini);
++    g.density         = Clamp(GetF(kGrass, L"density", g.density, ini), 1.0f, 8.0f);
++    g.densityDist     = Clamp(GetF(kGrass, L"densityDist", g.densityDist, ini), 5.0f, 150.0f);
++    g.densityFade     = Clamp(GetF(kGrass, L"densityFade", g.densityFade, ini), 0.05f, 1.0f);
++    g.spread          = Clamp(GetF(kGrass, L"spread", g.spread, ini), 0.1f, 4.0f);
++    g.wobble          = Clamp(GetF(kGrass, L"wobble", g.wobble, ini), 0.0f, 2.0f);
++    g.heightVar       = Clamp(GetF(kGrass, L"heightVar", g.heightVar, ini), 0.0f, 1.0f);
++    g.tintVar         = Clamp(GetF(kGrass, L"tintVar", g.tintVar, ini), 0.0f, 0.5f);
++    g.patch           = Clamp(GetF(kGrass, L"patch", g.patch, ini), 0.5f, 6.0f);
++    g.alphaRef        = GetI(kGrass, L"alphaRef", g.alphaRef, ini);
++    g.chunkSign       = GetI(kGrass, L"chunkSign", g.chunkSign, ini) >= 0 ? 1 : -1;
++    g.copyDebug       = GetI(kGrass, L"copyDebug", g.copyDebug, ini);
+ 
+     TimeSettings& tm = s.time;
+     tm.enabled      = GetB(kTime, L"enabled", tm.enabled, ini);
+diff --git a/src/config.h b/src/config.h
+index 346ef8e..161143f 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -689,6 +689,21 @@ struct GrassSettings
+     UINT  maxVerts    = 0;      // 0: no limit
+     int   primType    = 4;      // D3DPT_TRIANGLELIST
+     int   debug       = 0;      // 1: the bend as a colour (Debug View 30)
++    // Dense grass (EqAzeroth, 2026-11-09): the client's grass batch is drawn again with an offset, a tint and a
++    // stretch, all on the GPU (see grass.cpp, "dense grass"). density 1 = off, nothing extra is drawn.
++    float density     = 1.0f;   // 1..8: how many times each batch is drawn in all, as a smooth number (2.5 = 1 + 1 + 0.5)
++    float densityDist = 45.0f;  // yards: where the first extra copy has faded out; later copies end sooner
++    float densityFade = 0.35f;  // 0.05..1: the share of a copy's distance over which it fades out
++    float spread      = 1.2f;   // yards: how far a copy lies from the original blades
++    float wobble      = 0.45f;  // yards: a smooth change of the offset over the ground, so copies do not repeat
++    float heightVar   = 0.25f;  // yards: a copy's tip is higher or lower by up to this much
++    float tintVar     = 0.12f;  // 0..0.5: a copy's colour is warmer or greener by up to this much
++    float patch       = 1.5f;   // 0.5..6 yards: the size of the patches in which the copies are thinned out
++    int   alphaRef    = -1;     // -1: the client's alpha test; 0..255: alpha test (>=) for the copies, so see-through
++                                // parts of a card do not hide the copies behind it
++    int   chunkSign   = -1;     // which way a chunk lies from its corner: -1 towards lower x and y (the MCNK corner is
++                                // the largest), +1 towards higher. Used only for the slope under a copy
++    int   copyDebug   = 0;      // 1: copies drawn in flat red-to-yellow by their number (a look at what is drawn)
+ };
+ 
+ // The time of day on your screen only (timeofday.cpp, from comfytime, 2026-10-07). The server keeps its own.
+diff --git a/src/grass.cpp b/src/grass.cpp
+index 2d1829f..d46f261 100644
+--- a/src/grass.cpp
++++ b/src/grass.cpp
+@@ -30,6 +30,7 @@
+ #include "client.h"
+ #include "common.h"
+ #include "config.h"
++#include "mapterrain.h"
+ #include "shadercache.h"
+ 
+ #include <cctype>
+@@ -37,12 +38,13 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <map>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace
+ {
+     constexpr float kTwoPi = 6.2831853f;
+-    constexpr UINT  kWindConsts = 22;
++    constexpr UINT  kWindConsts = 27;   // c0..c21 the wind, c22..c26 the dense grass copies
+ 
+     GrassCalls g_calls = {};
+     bool       g_attached = false;
+@@ -54,6 +56,10 @@ namespace
+ 
+     IDirect3DVertexShader9* g_windVS = nullptr;
+     bool                    g_windVSTried = false;
++    IDirect3DVertexShader9* g_copyVS = nullptr;     // the same shader with the copy's offset, thinning, tint, fade
++    bool                    g_copyVSTried = false;
++    unsigned g_copyDraws = 0, g_copyDrawsLast = 0;  // extra draws this frame and last (dense grass)
++    unsigned g_slopeMiss = 0, g_slopeMissLast = 0;  // batches whose ground slope was not available
+ 
+     // This frame's and last frame's draws, for the probe.
+     unsigned g_draws = 0, g_verts = 0, g_drawsLast = 0, g_vertsLast = 0;
+@@ -559,11 +565,40 @@ float4 gMA : register(c18); // material ambient
+ float4 gME : register(c19); // material emissive
+ float4 gMS : register(c20); // ambient/diffuse/emissive from the vertex colour (1) or the material (0), lighting on
+ float4 gDb : register(c21); // x: 1 = the bend as a colour (Debug View 30)
++#if COPY
++// Dense grass: this shader draws a batch again as a copy (EqAzeroth). The batch's vertices carry no blade root, so a
++// copy is a translation of the whole batch by a smooth, position-dependent offset, with its own thinning, tint,
++// tip height and distance fade, all from the position and these constants.
++float4 gCp0 : register(c22); // offset xy (yards, chunk-local), unused, tip stretch (yards at the top of a blade)
++float4 gCp1 : register(c23); // tint rgb, the thinning threshold (the share of ground the copy covers, as a noise level)
++float4 gCp2 : register(c24); // offset wobble (yards), 1/patch (radians a yard), fade end (view depth), 1/fade span
++float4 gCp3 : register(c25); // the chunk's corner in the world (xy), the copy's phase, 1 = debug colour
++float4 gCp4 : register(c26); // the ground's slope (dz/dx, dz/dy) in the chunk, yards a hidden blade sinks, unused
++#endif
+ 
+ VsOut main(VsIn i)
+ {
+     VsOut o;
+     float3 p = i.pos;
++#if COPY
++    // The offset: a base vector for this copy plus a smooth wobble over the ground (a wavelength of several yards,
++    // so a card moves as one piece), from the world position so it does not repeat from chunk to chunk.
++    float2 cw  = p.xy + gCp3.xy;
++    float  ph  = gCp3.z;
++    float2 wob = float2(sin(dot(cw, float2(0.61, 0.79)) * gCp2.y + ph),
++                        sin(dot(cw, float2(-0.83, 0.55)) * gCp2.y * 1.31 + ph * 1.7)) * gCp2.x;
++    float2 o2  = gCp0.xy + wob;
++    // The thinning: smooth patches (about 1/gCp2.y yards wide) in which the copy grows. The threshold comes from a table
++    // (tools/grass_copy_model.py --table) so that the share of ground covered equals the share asked for.
++    float nz   = 0.5 + 0.25 * (sin(dot(cw, float2(1.31, 0.77)) * gCp2.y * 1.9 + ph * 2.3) +
++                               sin(dot(cw, float2(-0.71, 1.27)) * gCp2.y * 2.7 + ph * 3.1));
++    float keep = saturate((gCp1.w - nz) * 6.0 + 0.5);
++    p.xy += o2;
++    // The copy fades out with its distance from the camera, by sinking into the ground (below).
++    float vd   = dot(float4(p, 1.0), c3);
++    float vis  = keep * saturate((gCp2.z - vd) * gCp2.w);
++#endif
++    float3 q = p;   // the blade's own place before the wind (the parting measures from it)
+ 
+     // A vertex with alpha 0xFE carries its height up the model in the lowest 2 bits of r, g and b (see "detail
+     // models"): 0 at the ground, 63 at the top, 0 on a rigid model. The client writes only 0xFF and 0xC0 in
+@@ -582,6 +617,10 @@ VsOut main(VsIn i)
+     float tip  = 1.0 - base;
+     float wuv  = saturate((tip - gSh.x) * gSh.y);
+     float w    = lerp(wuv * wuv, height * height, marked);
++#if COPY
++    // The ground under the offset (the chunk's plane), the copy's own tip height, and the sink that hides it.
++    p.z += dot(o2, gCp4.xy) + lerp(tip, height, marked) * gCp0.w - (1.0 - vis) * gCp4.z;
++#endif
+ 
+     // The phase from the chunk-local position, which does not move with the camera, plus gWT with worldPhase.
+     float2 wxy    = p.xy + gWT.xy;
+@@ -598,7 +637,7 @@ VsOut main(VsIn i)
+     // The parting: blades lean away from the player. gPC is in this vertex's own chunk-local space, so this is
+     // one subtraction. The weight that hinges the wind hinges this too. The z term stops grass on a ledge above
+     // or below the player from reacting.
+-    float3 dp    = i.pos - gPC.xyz;
++    float3 dp    = q - gPC.xyz;
+     float  dd    = dot(dp.xy, dp.xy) + 1e-4;
+     float  dinv  = rsqrt(dd);
+     float  dist  = dd * dinv;
+@@ -622,6 +661,10 @@ VsOut main(VsIn i)
+     o.col = lerp(col, float4(lit, difM.a), gMS.w);
+     // Debug View 30: the bend, black where still and white at the tips; blue where it comes from the texture.
+     o.col = lerp(o.col, float4(w, w, lerp(1.0, w, marked), 1.0), gDb.x);
++#if COPY
++    o.col.rgb *= gCp1.rgb;
++    o.col.rgb = lerp(o.col.rgb, float3(1.0, frac(ph * 0.37), 0.0), gCp3.w);
++#endif
+ 
+     o.uv  = i.uv;
+     o.fog = lerp(1.0, saturate((gFg.y - o.pos.w) * gFg.z), gFg.w);
+@@ -654,6 +697,100 @@ VsOut main(VsIn i)
+         return g_windVS != nullptr;
+     }
+ 
++    // The copy shader: the same text with COPY 1. If it does not compile, no copies are drawn and the grass is as
++    // before; the wind shader is a separate object and is never touched by this.
++    bool EnsureCopyShader(IDirect3DDevice9* dev)
++    {
++        if (g_copyVS)
++            return true;
++        if (g_copyVSTried)
++            return false;
++        g_copyVSTried = true;
++        auto compile = reinterpret_cast<PFN_D3DCompile>(CompilerProc("D3DCompile"));
++        struct Macro { const char* name; const char* def; };   // D3D_SHADER_MACRO's layout (d3dcommon.h)
++        const Macro defs[] = { { "COPY", "1" }, { nullptr, nullptr } };
++        OgBlob* code = nullptr;
++        OgBlob* errs = nullptr;
++        if (!compile || FAILED(compile(kWindHlsl, strlen(kWindHlsl), "grasscopy", defs, nullptr, "main", "vs_2_0", 0, 0,
++                                       &code, &errs)) || !code)
++            Log("grass: the copy shader failed to compile, so dense grass is off: %s",
++                errs ? static_cast<const char*>(errs->lpVtbl->GetBufferPointer(errs)) : "(no compiler)");
++        else if (FAILED(dev->lpVtbl->CreateVertexShader(dev, static_cast<const DWORD*>(code->lpVtbl->GetBufferPointer(code)),
++                                                        &g_copyVS)) || !g_copyVS)
++        {
++            Log("grass: the copy shader could not be created, so dense grass is off");
++            g_copyVS = nullptr;
++        }
++        else
++            Log("grass: the copy shader is ready (density %.2f)", g_cfg.grass.density);
++        if (code) code->lpVtbl->Release(code);
++        if (errs) errs->lpVtbl->Release(errs);
++        return g_copyVS != nullptr;
++    }
++
++    // The ground's slope in a chunk, a plane through four heights from the map files (mapterrain.cpp reads them
++    // only while something that needs them is on: the sun shadows, the water, the volumetric light). Cached per
++    // chunk; without the heights the slope is 0 and a copy follows the original's height. A chunk lies from its
++    // corner towards lower x and y (the MCNK corner is the largest; [grass] chunkSign), which is an assumption
++    // that the probe's slope line lets you check.
++    struct Slope { float gx, gy; bool ok; unsigned retry; };
++    std::unordered_map<int64_t, Slope> g_slopes;
++    unsigned g_slopeFiles = 0, g_slopeFrame = 0;
++
++    bool ChunkSlope(const D3DMATRIX& w, float& gx, float& gy)
++    {
++        gx = gy = 0.0f;
++        if (!g_camOk)
++            return false;
++        const double ax = static_cast<double>(w.m[3][0]) + g_cam[0], ay = static_cast<double>(w.m[3][1]) + g_cam[1];
++        const int64_t key = (static_cast<int64_t>(llround(ax * 0.03)) << 32) ^ static_cast<uint32_t>(llround(ay * 0.03));
++        const unsigned v = MapFilesVersion();
++        if (v != g_slopeFiles)
++        {
++            g_slopes.clear();
++            g_slopeFiles = v;
++        }
++        auto it = g_slopes.find(key);
++        if (it != g_slopes.end() && (it->second.ok || g_slopeFrame < it->second.retry))
++        {
++            gx = it->second.gx;
++            gy = it->second.gy;
++            return it->second.ok;
++        }
++        const float sg = static_cast<float>(g_cfg.grass.chunkSign);
++        const float cx = static_cast<float>(ax) + sg * (100.0f / 6.0f), cy = static_cast<float>(ay) + sg * (100.0f / 6.0f);
++        float xp, xm, yp, ym;
++        Slope S = { 0.0f, 0.0f, false, g_slopeFrame + 180 };   // not available: ask again in a few seconds
++        if (MapGroundHeight(cx + 8.0f, cy, xp) && MapGroundHeight(cx - 8.0f, cy, xm) &&
++            MapGroundHeight(cx, cy + 8.0f, yp) && MapGroundHeight(cx, cy - 8.0f, ym))
++        {
++            S.gx = (xp - xm) / 16.0f;
++            S.gy = (yp - ym) / 16.0f;
++            S.ok = true;
++            gx = S.gx;
++            gy = S.gy;
++        }
++        g_slopes[key] = S;
++        return S.ok;
++    }
++
++    // The noise level below which a copy grows, for a share of the ground 0..1 (tools/grass_copy_model.py --table).
++    float ShareThreshold(float share)
++    {
++        static const float kShareThr[21] = {-1.000f, 0.074f, 0.144f, 0.207f, 0.265f, 0.318f, 0.365f, 0.406f, 0.440f, 0.471f,
++                                            0.500f, 0.530f, 0.561f, 0.595f, 0.636f, 0.683f, 0.735f, 0.793f, 0.856f, 0.926f,
++                                            1.083f};
++        const float x = (share < 0.0f ? 0.0f : share > 1.0f ? 1.0f : share) * 20.0f;
++        const int   i = x >= 20.0f ? 19 : static_cast<int>(x);
++        return kShareThr[i] + (kShareThr[i + 1] - kShareThr[i]) * (x - static_cast<float>(i));
++    }
++
++    float Hash1(float n)
++    {
++        const float x = sinf(n * 12.9898f) * 43758.5453f;
++        return x - floorf(x);
++    }
++
+     void MatMul(D3DMATRIX& out, const D3DMATRIX& a, const D3DMATRIX& b)
+     {
+         for (int r = 0; r < 4; ++r)
+@@ -828,6 +965,17 @@ bool GrassDraw(IDirect3DDevice9* dev, const GrassDrawArgs& d, HRESULT& hr)
+             mat.Ambient.b, mat.Emissive.r, mat.Emissive.g, mat.Emissive.b);
+     }
+ 
++    static bool rsLogged = false;
++    if (!rsLogged)
++    {
++        rsLogged = true;
++        // What the client draws grass with, to see whether a card's see-through parts write depth (see [grass] alphaRef).
++        Log("grass: render states ALPHATEST=%u REF=0x%02X FUNC=%u ALPHABLEND=%u SRC=%u DEST=%u ZENABLE=%u ZWRITE=%u CULL=%u",
++            rs(D3DRS_ALPHATESTENABLE, 0), rs(D3DRS_ALPHAREF, 0), rs(D3DRS_ALPHAFUNC, 0), rs(D3DRS_ALPHABLENDENABLE, 0),
++            rs(D3DRS_SRCBLEND, 0), rs(D3DRS_DESTBLEND, 0), rs(D3DRS_ZENABLE, 0), rs(D3DRS_ZWRITEENABLE, 0),
++            rs(D3DRS_CULLMODE, 0));
++    }
++
+     // The texture's span, needed only when the fill loop is not patched.
+     VSpan uv{ 0.0f, 1.0f };
+     if (!g_fillPatched || !g.models)
+@@ -860,6 +1008,83 @@ bool GrassDraw(IDirect3DDevice9* dev, const GrassDrawArgs& d, HRESULT& hr)
+     BodyMarkGrass(dev);   // the sun shadows shade it as the ground round it (2026-10-08)
+     hr = d.indexed ? g_calls.drawIdxPrim(dev, d.prim, d.bvi, d.mvi, d.nv, d.si, d.pc)
+                    : g_calls.drawPrim(dev, d.prim, d.sv, d.pc);
++
++    // Dense grass: the same batch again, a copy at a time, by the GPU. Each copy is one more draw of the same buffer
++    // (the client's vertex buffer cannot be read back, so nothing is copied), which differs in the constants alone.
++    // The copies come after the client's own draw, so the grass the client placed is always there.
++    const float extra = g.density - 1.0f;
++    if (extra > 0.001f && g_camOk && g_calls.setRS && EnsureCopyShader(dev))
++    {
++        // The nearest this batch can be: its origin is a corner of a 33.3 yard chunk, whose far corner is 47.2 away.
++        const float dmin = sqrtf(d.world->m[3][0] * d.world->m[3][0] + d.world->m[3][1] * d.world->m[3][1]) - 47.3f;
++        const int   K = static_cast<int>(ceilf(extra));
++        float gx = 0.0f, gy = 0.0f;
++        bool  slope = false, slopeDone = false;
++        // The chunk's corner in the world (absolute, so the thinning and the wobble run on across chunk borders; a float
++        // holds it to about 0.002 yards at the map's edge).
++        const float cwx = static_cast<float>(static_cast<double>(d.world->m[3][0]) + g_cam[0]);
++        const float cwy = static_cast<float>(static_cast<double>(d.world->m[3][1]) + g_cam[1]);
++
++        DWORD oldAT = 0, oldRef = 0, oldFn = 0;
++        const bool atest = g.alphaRef >= 0;
++        bool       atestSet = false;
++
++        for (int k = 1; k <= K; ++k)
++        {
++            const float endD = g.densityDist / (1.0f + 0.35f * static_cast<float>(k - 1));   // later copies end sooner
++            if (dmin >= endD)
++                break;
++            if (!slopeDone)
++            {
++                slopeDone = true;
++                slope = ChunkSlope(*d.world, gx, gy);
++                if (!slope)
++                    ++g_slopeMiss;
++            }
++            const float share = extra - static_cast<float>(k - 1) < 1.0f ? extra - static_cast<float>(k - 1) : 1.0f;
++            const float ang = static_cast<float>(k) * 2.3999632f + 0.7f;
++            const float rad = g.spread * (0.6f + 0.4f * Hash1(static_cast<float>(k) * 1.618f));
++            const float t   = Hash1(static_cast<float>(k) * 7.31f) * 2.0f - 1.0f;     // warmer .. greener
++            const float tv  = g.tintVar;
++            float cc[5][4] = {};
++            cc[0][0] = cosf(ang) * rad;  cc[0][1] = sinf(ang) * rad;
++            cc[0][3] = g.heightVar * (Hash1(static_cast<float>(k) * 3.77f) * 2.0f - 1.0f);
++            cc[1][0] = 1.0f + t * tv * 0.8f;
++            cc[1][1] = 1.0f + t * tv * 0.25f - fabsf(t) * tv * 0.10f;
++            cc[1][2] = 1.0f - t * tv * 0.9f;
++            cc[1][3] = ShareThreshold(share);
++            cc[2][0] = g.wobble;  cc[2][1] = 1.0f / g.patch;
++            cc[2][2] = endD;      cc[2][3] = 1.0f / (endD * g.densityFade);
++            cc[3][0] = cwx;       cc[3][1] = cwy;
++            cc[3][2] = static_cast<float>(k) * 1.9f + 0.37f;
++            cc[3][3] = g.copyDebug ? 1.0f : 0.0f;
++            cc[4][0] = gx;        cc[4][1] = gy;   cc[4][2] = 1.5f;
++
++            if (FAILED(g_calls.setVSConstF(dev, 22, &cc[0][0], 5)) || FAILED(g_calls.setVS(dev, g_copyVS)))
++                break;
++            if (atest && !atestSet)
++            {
++                atestSet = true;
++                dev->lpVtbl->GetRenderState(dev, D3DRS_ALPHATESTENABLE, &oldAT);
++                dev->lpVtbl->GetRenderState(dev, D3DRS_ALPHAREF, &oldRef);
++                dev->lpVtbl->GetRenderState(dev, D3DRS_ALPHAFUNC, &oldFn);
++                g_calls.setRS(dev, D3DRS_ALPHATESTENABLE, TRUE);
++                g_calls.setRS(dev, D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
++                g_calls.setRS(dev, D3DRS_ALPHAREF, static_cast<DWORD>(g.alphaRef > 255 ? 255 : g.alphaRef));
++            }
++            if (d.indexed)
++                g_calls.drawIdxPrim(dev, d.prim, d.bvi, d.mvi, d.nv, d.si, d.pc);
++            else
++                g_calls.drawPrim(dev, d.prim, d.sv, d.pc);
++            ++g_copyDraws;
++        }
++        if (atestSet)
++        {
++            g_calls.setRS(dev, D3DRS_ALPHATESTENABLE, oldAT);
++            g_calls.setRS(dev, D3DRS_ALPHAFUNC, oldFn);
++            g_calls.setRS(dev, D3DRS_ALPHAREF, oldRef);
++        }
++    }
+     // The fixed-function pipeline back, and the client's constants.
+     g_calls.setVS(dev, nullptr);
+     g_calls.setVSConstF(dev, 0, &g_vsConst[0][0], kWindConsts);
+@@ -881,6 +1106,11 @@ void GrassFrameEnd()
+     g_drawsLast = g_draws;
+     g_vertsLast = g_verts;
+     g_draws = g_verts = 0;
++    g_copyDrawsLast = g_copyDraws;
++    g_copyDraws = 0;
++    g_slopeMissLast = g_slopeMiss;
++    g_slopeMiss = 0;
++    ++g_slopeFrame;
+     g_offGridLast = g_offGrid;
+     g_offGrid = 0;
+     g_withPsLast = g_withPs;
+@@ -907,6 +1137,10 @@ void GrassReset()
+         g_windVS->lpVtbl->Release(g_windVS);
+     g_windVS = nullptr;
+     g_windVSTried = false;
++    if (g_copyVS)
++        g_copyVS->lpVtbl->Release(g_copyVS);
++    g_copyVS = nullptr;
++    g_copyVSTried = false;
+     g_layouts.clear();
+     g_vspan.clear();
+     g_vsConstSeeded = false;   // a Reset puts the constants back to their defaults
+@@ -938,9 +1172,16 @@ void GrassProbe()
+         g_vertsLast, g_withPsLast, g_offGridLast, g_camOk ? "" : " (no camera: the grid not tested)", g_fillPatched ? "patched (each vertex has its height)" : g_fillTried ? "NOT patched (the bend "
+         "comes from the texture)" : "not patched yet", g_windVS ? "ready" : g_windVSTried ? "FAILED" : "not made yet",
+         g_anchorValid ? "on the player" : "off (no player, on a ship, or [grass] parting 0)");
++    Log("grass: dense: density %.2f to %.0f yards, spread %.2f; %u extra draws last frame (%u batches without ground "
++        "slope); the copy shader %s; ground slopes cached %u",
++        g.density, g.densityDist, g.spread, g_copyDrawsLast, g_slopeMissLast,
++        g_copyVS ? "ready" : g_copyVSTried ? "FAILED" : g.density > 1.0f ? "not made yet" : "not needed (density 1)",
++        static_cast<unsigned>(g_slopes.size()));
+ }
+ 
+ void GrassShaderList()
+ {
+     ShaderPrecompile("grass", kWindHlsl, "vs_2_0");
++    static const char* const copyDefs[] = { "COPY", "1", nullptr };
++    ShaderPrecompile("grasscopy", kWindHlsl, "vs_2_0", copyDefs);
+ }
+diff --git a/src/grass.h b/src/grass.h
+index df150fe..b20b340 100644
+--- a/src/grass.h
++++ b/src/grass.h
+@@ -10,6 +10,7 @@ struct GrassCalls
+     HRESULT (STDMETHODCALLTYPE* drawIdxPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+     HRESULT (STDMETHODCALLTYPE* setVS)(IDirect3DDevice9*, IDirect3DVertexShader9*);
+     HRESULT (STDMETHODCALLTYPE* setVSConstF)(IDirect3DDevice9*, UINT, const float*, UINT);
++    HRESULT (STDMETHODCALLTYPE* setRS)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);   // optional (dense grass)
+ };
+ void GrassAttach(const GrassCalls& calls);
+ 
