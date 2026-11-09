@@ -81,6 +81,19 @@ Tested on synthetic archives only (`test_eqgrass.py`: 10 tests, including a PKWA
 ### The test DLL: built by GitHub Actions
 `.github/workflows/comfy-dense-grass.yml` (runner `windows-2022`, MSVC, `-A Win32`, actions pinned by commit SHA, source pinned to commit `73bebaa`) checks out ComfyAtmosphere `v0.17.1-alpha`, applies `comfy/0001-dense-grass-copies.patch` (`git apply --check` first), builds the config test and the DLL, checks the DLL is a 32-bit PE, runs `tools/check_grass_vs.py` (Microsoft D3DCompiler: both `vs_2_0` variants, instruction/register limits, the wind variant identical to upstream's), runs `tools/check_comfy_patches.py` (all EqAzeroth text patches, in order, against the built DLL), and uploads `comfyatmos-dense-grass-x86` (DLLs, example ini, install notes, checksums, shader and patch reports) and `build-logs`. It never replaces anything: the DLLs are named `comfyatmos.dense-grass*.dll`. Install and rollback: `comfy/INSTALL-TEST.txt`. Benchmark: `GRASS_BENCHMARK.md`.
 
+### CI result: first green build (run 42677414850, commit `64f62e9`)
+Confirmed by the runner (`windows-2022`, MSVC 19.44, Win32), read from the job log:
+| Check | Result |
+|---|---|
+| Source pin and patch | tag `v0.17.1-alpha` = `73bebaa`; `git apply --check` and apply clean; `git describe` = `v0.17.1-alpha-dirty` |
+| Build | `comfyatmos.dll` compiled and linked, **PE32 x86 DLL, 1,428,480 bytes** (the published release DLL is 1,420,800). The only MSVC warning was in the test file. |
+| Config test | built as x86 and **passed**: defaults, every key, clamping, `/atmos` override, both shipped inis (density 1.0 in the code default and in the preset) |
+| Shader, Microsoft D3DCompiler_47, vs_2_0 | wind variant **133 slots**, 6 temps; copy variant **213 slots** (limit 256), 8 temps (limit 12), constants up to c38; the copy variant reads c22..c26; the **wind variant's instructions are identical to the unpatched upstream shader** (131 lines) |
+| EqAzeroth text patches on the source build | all 9 apply in order; each reports `patched` right after; size unchanged; 11,200 bytes changed; dense-grass shader text intact afterwards |
+| Same patches on the published release DLL | identical byte counts per patch, so the source build is compatible with the DLL the patches were made for. `reflect` is superseded by `shoref`, as before |
+| Artifact | `comfyatmos-dense-grass-x86` (two DLLs, example ini, install notes, checksums, shader and patch reports) and `build-logs`, both kept 90 days |
+Still **not** confirmed: anything in the game (visuals, overlap holes, slope contact, performance, whether the client loads the DLL cleanly), and the patches that exist only in other sessions' trees (fog, lamp, foliage). The copy shader uses 213 of 256 slots: little room for more features in it.
+
 ### Test sequence (summary; the full procedure is `GRASS_BENCHMARK.md`)
 1. `density = 1`: confirm the grass is exactly as before; log line `grass: render states ...` appears.
 2. F12 probe: `grass: dense:` line says the copy shader is `ready` once density > 1; if `FAILED`, the log has the compile error and the grass stays native.

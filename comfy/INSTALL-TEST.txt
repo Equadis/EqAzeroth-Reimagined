@@ -1,6 +1,7 @@
 Dense-grass TEST build of comfyatmos.dll   (ComfyAtmosphere v0.17.1-alpha + comfy/0001-dense-grass-copies.patch, 32-bit)
 
-STATUS: built by CI and checked offline (see shader-report/, patch-report.md, BUILD-INFO.txt). NOT yet run in the game.
+STATUS: built by GitHub Actions (MSVC, x86) and checked: both shaders compile as vs_2_0 (133 / 213 of 256 slots), the config test passes,
+the EqAzeroth text patches apply in order. NOT yet run in the game (see shader-report/, patch-report.md, BUILD-INFO.txt).
 Dense grass is OFF by default (density = 1): with density 1 the grass is drawn exactly as before.
 
 Files
