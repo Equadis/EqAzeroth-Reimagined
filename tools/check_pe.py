@@ -1,5 +1,5 @@
-"""Prints a PE file's machine type and whether it is a DLL; exits 1 unless it is a 32-bit (x86) DLL.
-usage: python -I tools/check_pe.py <file.dll>"""
+"""Prints a PE file's machine type and whether it is a DLL; exits 1 unless it is a 32-bit (x86) DLL (or, with --exe, a 32-bit x86 image).
+usage: python -I tools/check_pe.py <file.dll> [--exe]"""
 import struct, sys
 
 d = open(sys.argv[1], "rb").read()
@@ -13,4 +13,5 @@ magic = struct.unpack_from("<H", d, pe + 24)[0]
 name = {0x14C: "x86 (i386)", 0x8664: "x64", 0x1C4: "ARM", 0xAA64: "ARM64"}.get(machine, hex(machine))
 print(f"{sys.argv[1]}: machine {name}, optional header {'PE32' if magic == 0x10B else 'PE32+' if magic == 0x20B else hex(magic)}, "
       f"{'DLL' if chars & 0x2000 else 'not a DLL'}, {len(d)} bytes")
-sys.exit(0 if machine == 0x14C and magic == 0x10B and chars & 0x2000 else 1)
+want_dll = "--exe" not in sys.argv
+sys.exit(0 if machine == 0x14C and magic == 0x10B and (chars & 0x2000 or not want_dll) else 1)

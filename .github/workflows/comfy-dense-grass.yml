@@ -76,7 +76,7 @@ jobs:
           cmake -S eq/comfy/tests -B build-test -A Win32 -DCOMFY_SRC="$PWD/comfy-src" 2>&1 | tee logs/config-test-configure.log
           cmake --build build-test --config Release 2>&1 | tee logs/config-test-build.log
           exe=$(find build-test -name grass_config_test.exe | head -1)
-          python -I eq/tools/check_pe.py "$exe"
+          python -I eq/tools/check_pe.py "$exe" --exe
           "$exe" "eq/EqShaders/Presets/comfyatmos.ini" "comfy-src/comfyatmos.ini" 2>&1 | tee logs/config-test.log
 
       - name: Configure (32-bit, Win32)
