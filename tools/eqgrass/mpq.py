@@ -2,9 +2,9 @@
 
 Reader: a port of ComfyAtmosphere's src/mpq.cpp (which is in daily use against real 1.12 archives): header at a 512
 aligned offset, encrypted hash/block tables, stored or zlib sectors (mask 0x02), single-unit files. Additions over
-that code: bzip2 sectors (0x10, via the stdlib) and an archive stack that applies the client's load order
-(base archives < patch.MPQ < patch-0..9 < patch-A..Z). Refused with a clear error: encrypted files, PKWARE implode,
-huffman/ADPCM sectors.
+that code: PKWARE implode (mask 0x08 and whole-file implode, pkware.py), bzip2 sectors (0x10, via the stdlib) and an
+archive stack that applies the client's load order (base archives < patch.MPQ < patch-0..9 < patch-A..Z). Refused
+with a clear error: encrypted files, huffman/ADPCM sectors and combined compression masks.
 
 Writer: stores each file as zlib sectors, or plain if that is smaller. Round-trip tested against this reader only;
 a hand-built archive has NOT been loaded by a 1.12 client by this code. See docs/GRASS_WORKFLOW.md.
@@ -14,6 +14,8 @@ import os
 import re
 import struct
 import zlib
+
+import pkware
 
 FLAG_IMPLODE, FLAG_COMPRESS, FLAG_ENCRYPTED = 0x100, 0x200, 0x10000
 FLAG_FIX_KEY, FLAG_SINGLE, FLAG_DELETED, FLAG_EXISTS = 0x20000, 0x1000000, 0x2000000, 0x80000000
@@ -144,18 +146,23 @@ class Archive:
             return raw[:fsize]
 
         def sector(p, want):
-            if len(p) >= want:
+            if len(p) >= want:               # a sector that did not get smaller is stored as it is
                 return p[:want]
-            if flags & FLAG_IMPLODE and not flags & FLAG_COMPRESS:
-                raise MpqError(f"{name}: PKWARE implode (not supported)")
-            m = p[0]
-            body = p[1:]
-            if m == 0x02:
-                out = zlib.decompress(body)
-            elif m == 0x10:
-                out = bz2.decompress(body)
-            else:
-                raise MpqError(f"{name}: sector compression 0x{m:02X} (only zlib and bzip2 are supported)")
+            try:
+                if flags & FLAG_IMPLODE and not flags & FLAG_COMPRESS:
+                    out = pkware.explode(p)  # whole-file implode: the sector is the PKWARE stream itself
+                else:
+                    m, body = p[0], p[1:]
+                    if m == 0x02:
+                        out = zlib.decompress(body)
+                    elif m == 0x08:
+                        out = pkware.explode(body)
+                    elif m == 0x10:
+                        out = bz2.decompress(body)
+                    else:
+                        raise MpqError(f"{name}: sector compression 0x{m:02X} (only zlib 0x02, PKWARE 0x08 and bzip2 0x10 are supported)")
+            except (zlib.error, OSError, ValueError, pkware.PkwareError) as e:
+                raise MpqError(f"{name}: cannot decompress a sector ({e})")
             if len(out) != want:
                 raise MpqError(f"{name}: sector size mismatch")
             return out
@@ -232,10 +239,13 @@ class Stack:
             a.close()
 
 
-def write_archive(path, files, sector_shift=3, compress=True):
-    """files: {archive path: bytes}. Writes an MPQ v1 with a (listfile). Overwrites path."""
+def write_archive(path, files, sector_shift=3, compress=True, raw_files=None):
+    """files: {archive path: bytes}. Writes an MPQ v1 with a (listfile). Overwrites path.
+    raw_files (tests): {name: (stored bytes, block flags, file size)} stored as given, for compression types the writer does not make."""
+    raw_files = dict(raw_files or {})
     files = dict(files)
-    files["(listfile)"] = ("\r\n".join(sorted(k for k in files if k != "(listfile)")) + "\r\n").encode("latin-1")
+    files["(listfile)"] = ("\r\n".join(sorted([k for k in files if k != "(listfile)"] + list(raw_files))) + "\r\n").encode("latin-1")
+    files.update({k: None for k in raw_files})
     sector = 512 << sector_shift
     n = len(files)
     hcount = 16
@@ -247,7 +257,11 @@ def write_archive(path, files, sector_shift=3, compress=True):
     hashes = [[M32, M32, M32, M32] for _ in range(hcount)]
     for idx, (name, data) in enumerate(sorted(files.items())):
         pos = hdr_size + len(body)
-        if not data:
+        if name in raw_files:
+            stored, flg, fsz = raw_files[name]
+            body += stored
+            block.append((pos, len(stored), fsz, flg))
+        elif not data:
             block.append((pos, 0, 0, FLAG_EXISTS))
         else:
             nsec = (len(data) + sector - 1) // sector

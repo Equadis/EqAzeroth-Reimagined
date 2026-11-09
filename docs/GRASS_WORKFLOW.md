@@ -57,29 +57,31 @@ Does the repo hold the grass assets or tools? **No**: no MPQ/M2/BLP/DBC and no `
 
 Expected effect (from the simulator, assumed card sizes): widening a card by about 1.4x raised near-ground coverage from 61% to 81% at the same vertex count; a three-card clump needs fewer instances than single tufts for the same coverage. Vertex count drives the client's CPU fill cost, so `--copies` costs CPU; `--widen` is free.
 
-### Run it (Windows, in the game folder's parent, nothing touches the game folder)
+### Run it (Windows; reads the game folder, writes only to `grass_out\`, changes nothing in the game folder)
+Needs Python 3.9+ (Pillow optional, for PNG previews of the textures).
 ```bash
 python -I tools/eqgrass/test_eqgrass.py
-python -I tools/eqgrass/eqgrass.py inspect --data D:\Octowow\Data --out grass_out --textures
+python -I tools/eqgrass/eqgrass.py archives --data D:\Octowow\Data
+python -I tools/eqgrass/eqgrass.py inspect  --data D:\Octowow\Data --out grass_out --zip
 ```
-Open `grass_out\models.csv`: check `path` is filled, `holders` shows `patch-Y.mpq` where expected, and the `class` column picks grass and spares flowers, red grass, rocks. If `inspect` stops with "no column holds file names" or "expected 4 doodad-id columns", the DBC layout differs from the assumption: send `grass_out\original\*.dbc`. Tune `--include` / `--exclude` regexes to the real model names, then:
+- `archives` lists the archive stack in the client's load order (base < `patch.MPQ` < `patch-0..9` < `patch-A..Z`), so you can see `patch-Y.mpq` outranks `patch.MPQ`, and which archives could not be read.
+- `inspect` reads the two ground-effect DBCs through that stack, resolves every doodad's M2, classifies it, and writes `grass_out\inspection-report.md`, `models.csv`, `archives.txt`, `original\` (the DBCs, the models, their textures as BLP and PNG).
+- **`--zip` writes `grass_out\grass_analysis.zip`: the one file to send.** It contains those outputs only (a few MB), never an archive and never your whole installation. The test suite checks the package holds no `.mpq`.
+- Open `inspection-report.md`: the `class` table must pick grass and spare flowers, red grass, rocks. If `inspect` stops with "no column holds file names" or "expected 4 doodad-id columns", the DBC layout differs from the assumption; if it reports an unsupported compression, send the archive name that `archives` prints. Tune `--include` / `--exclude` (regexes on the model file name) and run `inspect` again.
+Then, if the picks are right:
 ```bash
 python -I tools/eqgrass/eqgrass.py build --data D:\Octowow\Data --out grass_out --widen 1.35 --copies 0
 python -I tools/eqgrass/eqgrass.py build --data D:\Octowow\Data --out grass_out --widen 1.35 --copies 0 --apply
 python -I tools/eqgrass/eqgrass.py pack  --out grass_out --archive grass_out\patch-Y.mpq
 ```
-(The first `build` is a dry run printing old and new vertex counts.) Because `build` reads the models through the whole stack, it edits **what the game currently loads, including the existing `patch-Y.mpq` grass**. Install: rename the current `Data\patch-Y.mpq` to `patch-X.mpq` (still loaded, now lower priority) and put the new file in as `patch-Y.mpq`, which then overrides only the models it holds. `Launch_Stock.bat` must move `patch-X.mpq` aside as well, or stock mode keeps the new grass. If the other session's packer works, use it on `grass_out\build` instead of `pack`.
+(The first `build` is a dry run printing old and new vertex counts.) `build` reads the models through the whole stack, so it edits **what the game currently loads, including the existing `patch-Y.mpq` grass**. Install: rename the current `Data\patch-Y.mpq` to `patch-X.mpq` (still loaded, now lower priority) and put the new file in as `patch-Y.mpq`, which then overrides only the models it holds. `Launch_Stock.bat` must move `patch-X.mpq` aside as well, or stock mode keeps the new grass. If the other session's packer works, use it on `grass_out\build` instead of `pack`. The MPQ writer is round-trip tested only; the game has not loaded one it wrote.
 
-### Build and install the DLL (Windows, MSVC)
-```bash
-git clone https://github.com/aloofbit/comfyatmosphere && cd comfyatmosphere
-git checkout v0.17.1-alpha && git apply <repo>\comfy\0001-dense-grass-copies.patch
-cmake -B build -A Win32 && cmake --build build --config Release
-python -I <repo>\tools\check_grass_vs.py src\grass.cpp
-```
-Before replacing `comfyatmos.dll`, back it up and run every `tools/patch_comfy_*.py --check` against the **new** DLL: a source build is not the patched release DLL, and `HANDOFF_PHASE1.md` §4 records patches being lost this way. Reapply any that report "original".
+Tested on synthetic archives only (`test_eqgrass.py`: 10 tests, including a PKWARE decoder checked against zlib's blast test vector, the stack priority, the report and the zip contents). Not tested on the real game files.
 
-### Test sequence (one change at a time, camera held still, per `HANDOFF_PHASE1.md` §8)
+### The test DLL: built by GitHub Actions
+`.github/workflows/comfy-dense-grass.yml` (runner `windows-2022`, MSVC, `-A Win32`, actions pinned by commit SHA, source pinned to commit `73bebaa`) checks out ComfyAtmosphere `v0.17.1-alpha`, applies `comfy/0001-dense-grass-copies.patch` (`git apply --check` first), builds the config test and the DLL, checks the DLL is a 32-bit PE, runs `tools/check_grass_vs.py` (Microsoft D3DCompiler: both `vs_2_0` variants, instruction/register limits, the wind variant identical to upstream's), runs `tools/check_comfy_patches.py` (all EqAzeroth text patches, in order, against the built DLL), and uploads `comfyatmos-dense-grass-x86` (DLLs, example ini, install notes, checksums, shader and patch reports) and `build-logs`. It never replaces anything: the DLLs are named `comfyatmos.dense-grass*.dll`. Install and rollback: `comfy/INSTALL-TEST.txt`. Benchmark: `GRASS_BENCHMARK.md`.
+
+### Test sequence (summary; the full procedure is `GRASS_BENCHMARK.md`)
 1. `density = 1`: confirm the grass is exactly as before; log line `grass: render states ...` appears.
 2. F12 probe: `grass: dense:` line says the copy shader is `ready` once density > 1; if `FAILED`, the log has the compile error and the grass stays native.
 3. `density = 2`, `copyDebug = 1` (copies flat red/yellow), then `0`. Walk the camera over a slope: floating or sunk copies mean `chunkSign` or the slope source is wrong (try `chunkSign = 1`).

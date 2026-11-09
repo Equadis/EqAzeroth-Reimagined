@@ -12,6 +12,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import mpq                  # noqa: E402
+import pkware               # noqa: E402
 from dbc import Dbc         # noqa: E402
 from m2 import M2, M2Error  # noqa: E402
 
@@ -89,6 +90,28 @@ class MpqTests(unittest.TestCase):
             st.close()
 
 
+class PkwareTests(unittest.TestCase):
+    def test_blast_vector(self):
+        # the test vector shipped with zlib's contrib/blast (test.pk -> test.txt)
+        self.assertEqual(pkware.explode(bytes([0x00, 0x04, 0x82, 0x24, 0x25, 0x8f, 0x80, 0x7f])), b"AIAIAIAIAIAIA")
+
+    def test_code_tables_are_complete(self):
+        # a canonical code is complete when the Kraft sum is exactly 1; a mistyped table would break that
+        for count, _ in (pkware._LIT, pkware._LEN, pkware._DIST):
+            self.assertEqual(sum(c / 2 ** l for l, c in enumerate(count) if l), 1.0)
+
+    def test_pkware_sector_in_an_archive(self):
+        pk = bytes([0x00, 0x04, 0x82, 0x24, 0x25, 0x8f, 0x80, 0x7f])
+        with tempfile.TemporaryDirectory() as t:
+            f = os.path.join(t, "patch.MPQ")
+            mpq.write_archive(f, {}, raw_files={"X\\implode.bin": (b"\x08" + pk, mpq.FLAG_EXISTS | mpq.FLAG_COMPRESS | mpq.FLAG_SINGLE, 13),
+                                               "X\\whole.bin": (pk, mpq.FLAG_EXISTS | mpq.FLAG_IMPLODE | mpq.FLAG_SINGLE, 13)})
+            a = mpq.Archive(f)
+            self.assertEqual(a.read("X\\implode.bin"), b"AIAIAIAIAIAIA")
+            self.assertEqual(a.read("X\\whole.bin"), b"AIAIAIAIAIAIA")
+            a.close()
+
+
 class DbcTests(unittest.TestCase):
     def test_roundtrip(self):
         b = make_dbc([[1, 2, 3], [4, 5, 6]], b"\0abc\0")
@@ -163,14 +186,27 @@ class WorkflowTest(unittest.TestCase):
             files = {"DBFilesClient\\GroundEffectTexture.dbc": tex, "DBFilesClient\\GroundEffectDoodad.dbc": doo}
             for n, h in names:
                 files[f"World\\NoDXT\\Detail\\{n}.m2"] = make_m2(0.6, h, quads=2)
+            files["World\\NoDXT\\Detail\\Test.blp"] = b"BLP2" + bytes(60)
             mpq.write_archive(os.path.join(data, "patch.MPQ"), files)
             # an override archive replaces one model (BadGra01 taller), as patch-Y.mpq would
             mpq.write_archive(os.path.join(data, "patch-Y.mpq"), {"World\\NoDXT\\Detail\\BadGra01.m2": make_m2(0.6, 0.8, quads=2)})
             out = os.path.join(t, "out")
             run = lambda *a: subprocess.run([sys.executable, "-I", os.path.join(HERE, "eqgrass.py"), *a], capture_output=True, text=True)
-            r = run("inspect", "--data", data, "--out", out)
+            r = run("archives", "--data", data)
             self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-            self.assertIn("5 models found, 2 classified as grass", r.stdout)       # Gra01 and Gra09; Gra02 too low, Roc, Flo excluded
+            self.assertLess(r.stdout.index("patch-Y.mpq"), r.stdout.index("patch.MPQ"))     # highest priority first
+            r = run("inspect", "--data", data, "--out", out, "--zip")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            self.assertIn("models resolved to an M2: 5 of 5", open(os.path.join(out, "inspection-report.md"), encoding="utf-8").read())
+            import zipfile
+            with zipfile.ZipFile(os.path.join(out, "grass_analysis.zip")) as z:
+                names = set(z.namelist())
+            for want in ("models.csv", "inspection-report.md", "archives.txt", "original/GroundEffectTexture.dbc",
+                         "original/GroundEffectDoodad.dbc", "original/models/BadGra01.m2", "original/textures/World__NoDXT__Detail__Test.blp"):
+                self.assertIn(want, names)
+            self.assertFalse([n for n in names if n.lower().endswith(".mpq")])            # no archives in the package
+            rep = open(os.path.join(out, "inspection-report.md"), encoding="utf-8").read()
+            self.assertIn("| grass | 2 |", rep)                                           # Gra01 and Gra09; Gra02 too low, Roc, Flo excluded
             with open(os.path.join(out, "models.csv")) as f:
                 csv_txt = f.read()
             self.assertIn("patch-Y.mpq+patch.MPQ", csv_txt)                         # the override is what is read first
