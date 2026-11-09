@@ -1,0 +1,28 @@
+Dense-grass TEST build of comfyatmos.dll   (ComfyAtmosphere v0.17.1-alpha + comfy/0001-dense-grass-copies.patch, 32-bit)
+
+STATUS: built by CI and checked offline (see shader-report/, patch-report.md, BUILD-INFO.txt). NOT yet run in the game.
+Dense grass is OFF by default (density = 1): with density 1 the grass is drawn exactly as before.
+
+Files
+  comfyatmos.dense-grass.dll             source build + dense grass only
+  comfyatmos.dense-grass.eqpatched.dll   the same with EqAzeroth's tools/patch_comfy_*.py text patches applied in order
+                                         (water, shore, wavetile, reflect, shoref, glint, fogfar, splash, cloudvol).
+                                         Patches that live only in other sessions' trees (fog, lamp, foliage) are NOT in it.
+  comfyatmos.dense-grass.example.ini     [grass] section with the new keys (also in EqShaders/Presets/comfyatmos.ini)
+
+Install for a test (reversible; nothing is overwritten by this package)
+  1. Close WoW. In D:\Octowow:  copy comfyatmos.dll comfyatmos.dll.eq-backup   (keep this copy)
+  2. Copy comfyatmos.dense-grass.eqpatched.dll over comfyatmos.dll   (use the plain .dll instead to see stock Comfy + grass)
+  3. Merge the new [grass] keys from the example ini into comfyatmos.ini (or the preset): density, densityDist, ...
+     (Settings saved by the in-game sliders live in WTF\Config.wtf and win over the ini for sliders only; these keys are ini-only.)
+  4. Start with Launch_EqShaders.bat.
+Restore: close WoW, copy comfyatmos.dll.eq-backup back over comfyatmos.dll.
+
+Check it loaded:  Logs\comfyatmos.log must contain a version ending in -dirty and "grass:" lines;  /atmos probe (or F12) logs
+  "grass: dense: density 1.00 ..." and, once density is raised, "the copy shader ready".
+If the copy shader fails to compile the log says "the copy shader failed to compile, so dense grass is off" and the grass stays native.
+
+Switch on (live, no restart):  /atmos grass.density 2     /atmos grass.densityDist 45     /atmos reset  (drops live values)
+Off:                           /atmos grass.density 1     or density = 1 in comfyatmos.ini then /atmos reload (F11)
+
+Full test procedure: docs/GRASS_BENCHMARK.md
